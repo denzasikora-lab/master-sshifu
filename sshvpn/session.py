@@ -104,7 +104,8 @@ def connect(root):
         raise RuntimeError('Запустите connect в обычном терминале; остановка выполняется через Ctrl+C')
     if os.geteuid() != 0 or int(os.environ.get('SUDO_UID', '0')) == 0:
         raise RuntimeError('Для создания TUN запустите connect через sudo из учетной записи владельца проекта')
-    if root.stat().st_uid != int(os.environ['SUDO_UID']):
+    from .installation import owner_uid
+    if owner_uid(root) != int(os.environ['SUDO_UID']):
         raise RuntimeError('Владелец проекта не совпадает с SUDO_UID')
     descriptor = os.open(protected.CHECK_LOCK, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     try:

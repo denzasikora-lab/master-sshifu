@@ -1,0 +1,18 @@
+#!/bin/sh
+# Повседневный запуск только фиксированных команд установленного помощника.
+set -eu
+if [ "$#" -gt 1 ]; then
+    printf '%s\n' 'Допустимо: ./sshifu [connect|stop|status|check]' >&2
+    exit 2
+fi
+command_name="${1:-connect}"
+case "$command_name" in
+    connect|stop|status|check) ;;
+    *) printf '%s\n' 'Допустимо: ./sshifu [connect|stop|status|check]' >&2; exit 2 ;;
+esac
+helper='/Library/PrivilegedHelperTools/master-sshifu/launch'
+if [ ! -x "$helper" ]; then
+    printf '%s\n' 'Нужна однократная установка: sudo .venv/bin/python tools/install_launcher.py' >&2
+    exit 1
+fi
+exec /usr/bin/sudo -n -k -- "$helper" "$command_name"

@@ -145,7 +145,7 @@ class GuardedProcess:
         read_fd, self.writer = os.pipe()
         try:
             self.process = subprocess.Popen(
-                [sys.executable, str(Path(__file__).with_name("guard.py")), str(read_fd), *command],
+                [sys.executable, '-I', '-S', '-B', str(Path(__file__).with_name("guard.py")), str(read_fd), *command],
                 pass_fds=(read_fd,), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=stderr if stderr is not None else subprocess.DEVNULL, start_new_session=True)
         except BaseException:

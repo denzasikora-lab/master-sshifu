@@ -153,6 +153,106 @@ class Kernel:
         del self.routes[route.prefix]
 
 
+class PasswordlessTests(unittest.TestCase):
+    def test_policy_only_grants_fixed_commands_without_general_python(self):
+        from sshvpn.installation import sudoers, COMMANDS, INSTALL_ROOT
+        policy = sudoers('testuser')
+        self.assertIn('NOPASSWD: NOSETENV:', policy)
+        self.assertNotIn('*', policy)
+        self.assertNotIn('python', policy)
+        self.assertNotIn('(ALL)', policy)
+        for name in COMMANDS:
+            self.assertIn(str(INSTALL_ROOT / 'launch') + ' ' + name, policy)
+        with self.assertRaises(ValueError):
+            sudoers('testuser ALL=(ALL)')
+
+    def test_entry_rejects_arbitrary_commands_before_privileged_work(self):
+        from sshvpn.installation import installed_main
+        with mock.patch('sshvpn.installation.owner_uid') as owner:
+            for arguments in ([], ['connect', '--other'], ['python'], ['check;id']):
+                with self.subTest(arguments=arguments), self.assertRaises(RuntimeError):
+                    installed_main(arguments)
+            owner.assert_not_called()
+
+    def test_secure_paths_reject_nonroot_and_writable_parents(self):
+        from sshvpn.installation import secure_path
+        from types import SimpleNamespace
+        path = Path('/fixed/child')
+        with mock.patch.object(Path, 'resolve', return_value=path), \
+                mock.patch.object(Path, 'stat', return_value=SimpleNamespace(st_uid=501, st_mode=0o755)):
+            with self.assertRaisesRegex(RuntimeError, 'Небезопасные права'):
+                secure_path(path)
+        with mock.patch.object(Path, 'resolve', return_value=path), \
+                mock.patch.object(Path, 'stat', side_effect=[SimpleNamespace(st_uid=0, st_mode=0o755),
+                    SimpleNamespace(st_uid=0, st_mode=0o775)]):
+            with self.assertRaisesRegex(RuntimeError, 'Небезопасные права'):
+                secure_path(path)
+
+    def test_source_snapshot_rejects_links_and_ignores_unrelated_files(self):
+        from sshvpn.installation import source_files
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            for directory in ('vendor', 'sshvpn', 'rules'):
+                (root / directory).mkdir()
+            for path in ('vpn.py', 'config.json', 'vendor/sing-box', 'vendor/provenance.json',
+                         'sshvpn/__init__.py', 'rules/local-domains.txt', 'private.key'):
+                (root / path).write_text('test', encoding='utf-8')
+            self.assertNotIn(Path('private.key'), source_files(root))
+            (root / 'vendor/sing-box').unlink()
+            (root / 'vendor/sing-box').symlink_to(root / 'private.key')
+            with self.assertRaisesRegex(RuntimeError, 'Недопустимый файл'):
+                source_files(root)
+
+    def test_failed_policy_validation_restores_previous_installation(self):
+        from sshvpn import installation
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name) / 'source'
+            root.mkdir()
+            (root / 'vpn.py').write_text('print(1)', encoding='utf-8')
+            helper = Path(name) / 'helpers/master-sshifu'
+            helper.mkdir(parents=True)
+            (helper / 'previous').write_text('сохранить', encoding='utf-8')
+            policy = Path(name) / 'policies/master-sshifu'
+            policy.parent.mkdir()
+            policy.write_text('previous policy', encoding='utf-8')
+            calls = []
+
+            def command(args, **kwargs):
+                calls.append(args)
+                if args == ['/usr/sbin/visudo', '-c']:
+                    raise subprocess.CalledProcessError(1, args)
+
+            with mock.patch.object(installation, 'INSTALL_ROOT', helper), \
+                    mock.patch.object(installation, 'POLICY', policy), \
+                    mock.patch.object(installation, 'secure_path'), \
+                    mock.patch.object(installation, 'owner_uid', return_value=os.getuid()), \
+                    mock.patch.object(installation, 'system_python', return_value='/usr/bin/python3'), \
+                    mock.patch.object(installation, 'source_files', return_value=[Path('vpn.py')]), \
+                    mock.patch('sshvpn.config.load'), mock.patch('sshvpn.runtime.binary'), \
+                    mock.patch('sshvpn.installation.subprocess.run', side_effect=command):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    installation._install_locked(root, os.getuid())
+            self.assertEqual((helper / 'previous').read_text(encoding='utf-8'), 'сохранить')
+            self.assertEqual(policy.read_text(encoding='utf-8'), 'previous policy')
+            self.assertEqual(policy.stat().st_mode & 0o777, 0o440)
+            self.assertTrue(any('-cf' in call for call in calls))
+            self.assertFalse(any('connect' in call for call in calls))
+
+    def test_isolated_entry_ignores_pythonpath_injection(self):
+        with tempfile.TemporaryDirectory() as name:
+            target = Path(name)
+            marker = target / 'executed'
+            (target / 'sitecustomize.py').write_text(
+                'from pathlib import Path\nPath(' + repr(str(marker)) + ').touch()\n', encoding='utf-8')
+            env = dict(os.environ, PYTHONPATH=str(target))
+            result = subprocess.run([sys.executable, '-I', '-S', '-B', str(ROOT / 'vpn.py'), 'server-config'],
+                env=env, cwd=target, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                encoding='utf-8', timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)['inbounds'][0]['listen'], '127.0.0.1')
+            self.assertFalse(marker.exists())
+
+
 class InstallerTests(unittest.TestCase):
     def test_bad_archive_hash_never_overwrites_existing_binary(self):
         from tools.install_sing_box import extract_verified
@@ -470,7 +570,7 @@ class SessionTests(unittest.TestCase):
                     process.pid = 13000
                     if '_watchdog' in args:
                         self.assertIn('--interactive', args)
-                        reader = os.dup(int(args[4]))
+                        reader = os.dup(int(args[args.index('_watchdog') + 2]))
                         readers.append(reader)
                     else:
                         live['dns'] = True

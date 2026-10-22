@@ -256,7 +256,8 @@ def run(root, duration=600, self_test=False, protected=False, fault=None, manual
     if uid == 0:
         raise RuntimeError("Запускайте через sudo из учетной записи владельца проекта")
     user = pwd.getpwuid(uid)
-    if root.stat().st_uid != uid:
+    from .installation import owner_uid
+    if owner_uid(root) != uid:
         raise RuntimeError("Владелец проекта не совпадает с SUDO_UID")
     if interactive:
         reject_vpn_conflict(MacRoutes())
@@ -321,7 +322,7 @@ def run(root, duration=600, self_test=False, protected=False, fault=None, manual
         command([executable, "check", "-c", str(scratch / "client.json")])
         clean_env = {"HOME": user.pw_dir, "USER": user.pw_name, "LOGNAME": user.pw_name,
                      "PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "PYTHONIOENCODING": "utf-8"}
-        exported = json.loads(command([sys.executable, str(root / "vpn.py"), "_export-system"],
+        exported = json.loads(command([sys.executable, '-I', '-S', '-B', str(root / "vpn.py"), "_export-system"],
             user=uid, group=user.pw_gid, extra_groups=os.getgrouplist(user.pw_name, user.pw_gid), env=clean_env))
         if protected or self_test:
             from .protected import LimitedRoutes, baseline_routes
@@ -339,7 +340,7 @@ def run(root, duration=600, self_test=False, protected=False, fault=None, manual
         atomic(scratch / "baseline.json", {"routes": kernel.rows(),
               "dns": command(["/usr/sbin/scutil", "--dns"]), "server_ip": exported["server_ip"]})
         read_fd, heartbeat = os.pipe()
-        guard_command = [sys.executable, str(root / "vpn.py"), "_watchdog", str(journal_path),
+        guard_command = [sys.executable, '-I', '-S', '-B', str(root / "vpn.py"), "_watchdog", str(journal_path),
                                   str(read_fd), str(30 if fault and self_test else
                                                     240 if protected else duration + 360 if manual else
                                                     600 if interactive else duration + 660 if duration else 0)]
