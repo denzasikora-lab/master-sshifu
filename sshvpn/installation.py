@@ -252,7 +252,7 @@ def _install_locked(root, uid):
         subprocess.run(['/usr/sbin/visudo', '-c'], check=True)
         if backup.exists():
             shutil.rmtree(backup)
-        print('Установлено. Теперь ./sshifu check, затем ./sshifu без пароля. VPN не запускался.', flush=True)
+        print('Готово. Теперь можно запускать ./sshifu без пароля.', flush=True)
     except BaseException:
         if published:
             if previous_policy is None:
