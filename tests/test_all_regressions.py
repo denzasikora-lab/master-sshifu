@@ -8,6 +8,7 @@ import multiprocessing
 import os
 from pathlib import Path
 import shutil
+import signal
 import socket
 import socketserver
 import statistics
@@ -861,6 +862,41 @@ class MeasurementTests(unittest.TestCase):
 
 
 class SystemSafetyTests(unittest.TestCase):
+    def test_repeated_terminal_interrupt_cannot_abort_cleanup_command(self):
+        with tempfile.TemporaryDirectory() as name:
+            ready = Path(name) / 'ready'
+            child = ('from pathlib import Path;import os,sys,time;'
+                     'Path(sys.argv[1]).write_text(str(os.getpid()),encoding="utf-8");'
+                     'time.sleep(0.6);print("cleanup-ok")')
+            parent = ('import signal,sys;signal.signal(signal.SIGINT,lambda *_:None);'
+                      'sys.path.insert(0,sys.argv[1]);from sshvpn.system import command;'
+                      'print(command([sys.executable,"-I","-S","-c",sys.argv[2],sys.argv[3]]).strip())')
+            process = subprocess.Popen([sys.executable, '-I', '-S', '-c', parent, str(ROOT), child, str(ready)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8',
+                start_new_session=True)
+            try:
+                deadline = time.monotonic() + 5
+                while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(ready.exists(), 'Проверочная команда не запустилась')
+                child_pid = int(ready.read_text(encoding='utf-8'))
+                for _ in range(3):
+                    # Терминал посылает сигнал только участникам передней группы.
+                    os.kill(process.pid, signal.SIGINT)
+                    try:
+                        if os.getpgid(child_pid) == process.pid:
+                            os.kill(child_pid, signal.SIGINT)
+                    except ProcessLookupError:
+                        pass
+                    time.sleep(0.03)
+                output, error = process.communicate(timeout=5)
+                self.assertEqual(process.returncode, 0, error)
+                self.assertEqual(output.strip(), 'cleanup-ok')
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                process.communicate(timeout=5)
+
     def test_direct_dns_uses_dhcp_without_public_fallback(self):
         from sshvpn.config import physical_dns
         with mock.patch("sshvpn.config.subprocess.check_output", return_value="192.168.3.1\n") as execute:

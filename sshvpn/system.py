@@ -69,6 +69,8 @@ def reject_vpn_conflict(kernel):
 
 
 def command(args, **kwargs):
+    # Повторный Ctrl+C не должен прерывать route/netstat/scutil во время отката.
+    kwargs.setdefault('start_new_session', True)
     return subprocess.check_output(args, text=True, encoding="utf-8", timeout=kwargs.pop("timeout", 15),
                                    stderr=subprocess.STDOUT, **kwargs)
 
