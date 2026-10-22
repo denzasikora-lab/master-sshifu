@@ -1,0 +1,6 @@
+[project]
+name = "master-sshifu"
+version = "0.2.0"
+description = "SSH VPN для macOS с прямым выходом ru, цветными статусами и аварийным откатом"
+requires-python = ">=3.12"
+dependencies = []

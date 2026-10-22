@@ -1,0 +1,14 @@
+{
+  "ssh_alias": "master-sshifu",
+  "ssh_cipher": "default",
+  "physical_interface": "en0",
+  "listen_port": 43180,
+  "forward_port": 43181,
+  "dns_port": 43153,
+  "remote_socks_port": 43190,
+  "backend_ready": false,
+  "dns_direct": "dhcp",
+  "dns_tunnel": "1.1.1.1",
+  "max_restarts": 5,
+  "connect_timeout": 15
+}

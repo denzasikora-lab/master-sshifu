@@ -1,0 +1,8 @@
+{
+  "log": {"level": "warn", "timestamp": true},
+  "inbounds": [
+    {"type": "socks", "tag": "backend", "listen": "127.0.0.1", "listen_port": 43190}
+  ],
+  "outbounds": [{"type": "direct", "tag": "egress"}],
+  "route": {"final": "egress"}
+}

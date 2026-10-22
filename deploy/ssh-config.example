@@ -1,0 +1,11 @@
+# Добавьте блок в ~/.ssh/config на Mac, заменив IP и при необходимости порт.
+Host master-sshifu
+    HostName 203.0.113.10
+    User sshifu
+    Port 22
+    IdentityFile ~/.ssh/master-sshifu_ed25519
+    IdentitiesOnly yes
+    BatchMode yes
+    StrictHostKeyChecking yes
+    ForwardAgent no
+    Compression no
