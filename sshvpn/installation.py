@@ -78,7 +78,8 @@ def sudoers(username):
 def source_files(root):
     paths = [Path('vpn.py'), Path('config.json'), Path('vendor/sing-box'), Path('vendor/provenance.json')]
     paths += [p.relative_to(root) for p in sorted((root / 'sshvpn').glob('*.py'))]
-    paths += [p.relative_to(root) for p in sorted((root / 'rules').glob('*.txt'))]
+    paths += [Path('rules') / name for name in ('direct-domains.txt', 'direct-cidrs.txt',
+              'local-domains.txt', 'local-cidrs.txt') if (root / 'rules' / name).exists()]
     for path in paths:
         original = root / path
         if original.is_symlink() or not original.is_file() or not original.resolve().is_relative_to(root.resolve()):

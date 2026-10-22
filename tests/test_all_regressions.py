@@ -195,9 +195,10 @@ class PasswordlessTests(unittest.TestCase):
             for directory in ('vendor', 'sshvpn', 'rules'):
                 (root / directory).mkdir()
             for path in ('vpn.py', 'config.json', 'vendor/sing-box', 'vendor/provenance.json',
-                         'sshvpn/__init__.py', 'rules/local-domains.txt', 'private.key'):
+                         'sshvpn/__init__.py', 'rules/local-domains.txt', 'rules/private.txt', 'private.key'):
                 (root / path).write_text('test', encoding='utf-8')
             self.assertNotIn(Path('private.key'), source_files(root))
+            self.assertNotIn(Path('rules/private.txt'), source_files(root))
             (root / 'vendor/sing-box').unlink()
             (root / 'vendor/sing-box').symlink_to(root / 'private.key')
             with self.assertRaisesRegex(RuntimeError, 'Недопустимый файл'):
