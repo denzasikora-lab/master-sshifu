@@ -31,6 +31,9 @@ def load(root):
     if not 0 <= c["max_restarts"] <= 10 or not 1 <= c["connect_timeout"] <= 60:
         raise ValueError("Некорректные пределы переподключения")
     c.setdefault("ssh_cipher", "default")
+    c.setdefault('ipv6_enabled', False)
+    if type(c['ipv6_enabled']) is not bool:
+        raise ValueError('ipv6_enabled должен быть логическим значением')
     if c["ssh_cipher"] not in CIPHERS:
         raise ValueError("Неподдерживаемый SSH-шифр")
     return c
@@ -50,8 +53,9 @@ def physical_dns(interface):
 
 def client(c, rules, mode="trial", interface=None, dns_ports=None):
     physical = interface or c["physical_interface"]
+    strategy = 'prefer_ipv4' if c.get('ipv6_enabled', False) else 'ipv4_only'
     direct = {"type": "direct", "tag": "direct", "bind_interface": physical,
-              "domain_resolver": "dns-direct", "connect_timeout": "10s"}
+              "domain_resolver": {"server": "dns-direct", "strategy": strategy}, "connect_timeout": "10s"}
     proxy = {"type": "socks", "tag": "ssh", "server": "127.0.0.1",
              "server_port": c["forward_port"], "version": "5", "bind_interface": "lo0",
              "connect_timeout": "10s"}
@@ -90,16 +94,21 @@ def client(c, rules, mode="trial", interface=None, dns_ports=None):
         route_rules.append({"domain_suffix": rules.domains, "action": "route", "outbound": "direct"})
     if rules.cidrs:
         route_rules.append({"ip_cidr": rules.cidrs, "action": "route", "outbound": "direct"})
+    # После восстановления FakeIP домен разрешается явно, прежде чем попасть в SOCKS.
+    route_rules.append({'action': 'resolve', 'strategy': strategy})
     dns_rules = []
     if rules.domains:
         dns_rules.append({"domain_suffix": rules.domains, "action": "route", "server": "dns-direct"})
     if mode == "system":
         # Временные адреса сохраняют связь с доменом для маршрутизации TUN.
-        dns_rules.insert(0, {"query_type": ["A", "AAAA"], "action": "route", "server": "dns-fake",
+        dns_rules.insert(0, {"query_type": ["A", "AAAA"] if c.get('ipv6_enabled', False) else ['A'],
+                            "action": "route", "server": "dns-fake",
                             "rewrite_ttl": 1})
+    if not c.get('ipv6_enabled', False):
+        dns_rules.insert(0, {'query_type': ['AAAA'], 'action': 'predefined', 'rcode': 'NOERROR'})
     return {"log": {"level": "warn", "timestamp": True},
             "dns": {"servers": servers, "rules": dns_rules, "final": "dns-ssh",
-                    "reverse_mapping": True, "strategy": "prefer_ipv4"},
+                    "reverse_mapping": True, "strategy": strategy},
             "inbounds": inbounds, "outbounds": [direct, proxy],
             "route": {"rules": route_rules, "final": "ssh", "default_domain_resolver": "dns-ssh"}}
 

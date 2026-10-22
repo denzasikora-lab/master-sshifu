@@ -1,6 +1,7 @@
 {
   "ssh_alias": "master-sshifu",
   "ssh_cipher": "default",
+  "ipv6_enabled": false,
   "physical_interface": "en0",
   "listen_port": 43180,
   "forward_port": 43181,

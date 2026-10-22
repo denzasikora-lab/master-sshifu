@@ -21,19 +21,29 @@ REPORT = Path('/private/var/run/ssh-split-session.json')
 LOG = Path('/private/var/run/ssh-split-session.log')
 
 
-def healthy(expected, pulse):
+def healthy(expected, pulse, config=None, socks_port=None):
+    connect_timeout = max(3, min(10, (config or {}).get('connect_timeout', 10)))
+    total_timeout = connect_timeout + 3
     for endpoint in ('https://api.ipify.org', 'https://ipv4.icanhazip.com'):
         pulse()
         started = time.monotonic()
-        result = {'event': 'health_probe', 'time': time.time(), 'endpoint': endpoint}
+        result = {'event': 'health_probe', 'time': time.time(), 'endpoint': endpoint,
+                  'path': 'socks' if socks_port else 'system',
+                  'connect_timeout': connect_timeout, 'total_timeout': total_timeout}
         try:
-            value = system.command(['/usr/bin/curl', '--noproxy', '*', '-4fsS',
-                '--connect-timeout', '3', '--max-time', '5', endpoint], timeout=6).strip()
+            arguments = ['/usr/bin/curl', '-q', '--noproxy', '' if socks_port else '*', '-4fsS',
+                         '--connect-timeout', str(connect_timeout), '--max-time', str(total_timeout)]
+            if socks_port:
+                arguments += ['--socks5-hostname', '127.0.0.1:' + str(socks_port)]
+            value = system.command(arguments + [endpoint], timeout=total_timeout + 1).strip()
             ok = str(ipaddress.IPv4Address(value)) == expected
             result.update(ok=ok, reason=None if ok else 'Внешний IP не совпал с сервером')
             return ok
         except (ValueError, OSError, subprocess.SubprocessError) as error:
             result.update(ok=False, error_type=type(error).__name__, error=str(error)[:1000])
+            if isinstance(error, subprocess.CalledProcessError) and error.output:
+                output = error.output.decode('utf-8', errors='replace') if isinstance(error.output, bytes) else str(error.output)
+                result['curl_output'] = output[-2000:]
         finally:
             result['seconds'] = round(time.monotonic() - started, 3)
             logging.getLogger('sshvpn.session').info(json.dumps(result, ensure_ascii=False))
@@ -66,7 +76,7 @@ def emergency_report(journal):
         pass
 
 
-def reconnect(previous, command, username, log_path, config, pulse, requested):
+def reconnect(previous, command, username, log_path, config, pulse, requested, verify=None):
     terminate([previous])
     child = None
     delivered = False
@@ -89,8 +99,17 @@ def reconnect(previous, command, username, log_path, config, pulse, requested):
                     raise InterruptedError('Остановка во время восстановления SSH')
                 pulse()
                 if greeting(config['forward_port']):
-                    delivered = True
-                    return child
+                    verified = verify is None or verify()
+                    logging.getLogger('sshvpn.session').info(json.dumps({
+                        'event': 'ssh_reconnect_attempt', 'time': time.time(),
+                        'attempt': attempt + 1, 'pid': child.process.pid,
+                        'backend_ready': True, 'exit_verified': verified,
+                        'exit_probe_required': verify is not None}, ensure_ascii=False))
+                    if verified:
+                        child.reconnect_attempts = attempt + 1
+                        delivered = True
+                        return child
+                    break
                 time.sleep(0.2)
             terminate([child])
         raise RuntimeError('SSH не восстановился за ограниченное число попыток: выполняется откат')

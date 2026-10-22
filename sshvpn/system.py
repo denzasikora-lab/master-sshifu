@@ -455,7 +455,25 @@ def run(root, duration=600, self_test=False, protected=False, fault=None, manual
             save("ready", external_ip=ip)
         deadline = time.monotonic() + duration if duration else float("inf")
         next_health, next_routes, failures = time.monotonic() + 15 if interactive else 0, 0, 0
-        recovery_incidents = 0
+        recovery_attempts = 0
+
+        def recover_ssh():
+            nonlocal recovery_attempts, failures, next_health
+            from .session import reconnect, healthy
+            remaining = c['max_restarts'] - recovery_attempts
+            if remaining <= 0:
+                raise RuntimeError('Исчерпан предел восстановления SSH без успешного системного выхода: выполняется откат')
+            save('reconnecting', reconnects=state['reconnects'] + 1, health_reconnect_pending=True,
+                 transport_exit_verified=False)
+            children[0] = reconnect(children[0], exported['command'], user.pw_name,
+                scratch / 'ssh.log', dict(c, max_restarts=remaining), pulse, requested,
+                verify=lambda: healthy(exported['server_ip'], pulse, config=c, socks_port=c['listen_port']))
+            recovery_attempts += children[0].reconnect_attempts
+            save('reconnecting', child_guard_pids=[p.process.pid for p in children],
+                 transport_exit_verified=True, transport_exit_verified_at=time.time(),
+                 reconnect_attempts_since_health=recovery_attempts)
+            failures, next_health = 0, 0
+
         while not requested() and time.monotonic() < deadline:
             pulse()
             if children[-1].poll() is not None or dns.poll() is not None:
@@ -468,14 +486,7 @@ def run(root, duration=600, self_test=False, protected=False, fault=None, manual
                     raise RuntimeError("Маршруты VPN изменились")
                 next_routes = time.monotonic() + 2
             if interactive and children[0].poll() is not None:
-                from .session import reconnect
-                recovery_incidents += 1
-                if recovery_incidents > c["max_restarts"]:
-                    raise RuntimeError("SSH повторно падает без успешной проверки выхода: выполняется откат")
-                save("reconnecting", reconnects=state["reconnects"] + 1)
-                children[0] = reconnect(children[0], exported["command"], user.pw_name,
-                    scratch / "ssh.log", c, pulse, requested)
-                next_health = 0
+                recover_ssh()
             elif children[0].poll() is not None:
                 raise RuntimeError("Процесс SSH завершился")
             if time.monotonic() >= next_health:
@@ -483,7 +494,7 @@ def run(root, duration=600, self_test=False, protected=False, fault=None, manual
                 try:
                     if interactive:
                         from .session import healthy
-                        ok = healthy(exported["server_ip"], pulse)
+                        ok = healthy(exported["server_ip"], pulse, config=c)
                     else:
                         ip = command(["/usr/bin/curl", "--noproxy", "*", "-4fsS", "--max-time", "5", "https://api.ipify.org"]).strip()
                         ok = ip == exported["server_ip"]
@@ -493,19 +504,13 @@ def run(root, duration=600, self_test=False, protected=False, fault=None, manual
                 save(state['phase'], last_health_check=time.time(), consecutive_health_failures=failures,
                      health_checks=state.get('health_checks', 0) + 1)
                 if failures >= 3:
-                    if not interactive or state.get("health_reconnect_pending"):
+                    if not interactive:
                         raise RuntimeError("Три проверки выхода не прошли: аварийный откат")
-                    from .session import reconnect
-                    recovery_incidents += 1
-                    save("reconnecting", reconnects=state["reconnects"] + 1,
-                         health_reconnect_pending=True)
-                    children[0] = reconnect(children[0], exported["command"], user.pw_name,
-                        scratch / "ssh.log", c, pulse, requested)
-                    failures = 0
+                    recover_ssh()
                 elif failures == 0 and interactive:
-                    recovery_incidents = 0
+                    recovery_attempts = 0
                     save("ready", health_reconnect_pending=False, last_health=time.time(),
-                         external_ip=exported["server_ip"])
+                         external_ip=exported["server_ip"], reconnect_attempts_since_health=0)
                 next_health = time.monotonic() + 15
             time.sleep(0.5)
         save("stopping")

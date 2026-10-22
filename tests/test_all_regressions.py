@@ -70,9 +70,9 @@ def socks(port_number, target, target_port, command=1):
     return stream, (socket.inet_ntoa(address) if size == 4 else "127.0.0.1", bound_port)
 
 
-def query(name, ident=1234):
+def query(name, ident=1234, qtype=1):
     encoded = b"".join(bytes([len(p)]) + p.encode("ascii") for p in name.split(".")) + b"\0"
-    return struct.pack("!6H", ident, 0x100, 1, 0, 0, 0) + encoded + struct.pack("!HH", 1, 1)
+    return struct.pack("!6H", ident, 0x100, 1, 0, 0, 0) + encoded + struct.pack("!HH", qtype, 1)
 
 
 def udp_payload(packet):
@@ -539,11 +539,63 @@ class SessionTests(unittest.TestCase):
             self.assertFalse(healthy('192.0.2.1', lambda: None))
             fetch.assert_called_once()
 
+    def test_health_time_budget_uses_config_and_preserves_watchdog_margin(self):
+        from sshvpn.session import healthy
+        for configured, connection in ((1, 3), (7, 7), (15, 10)):
+            with self.subTest(configured=configured), \
+                    mock.patch('sshvpn.system.command', return_value='192.0.2.1\n') as fetch, \
+                    self.assertLogs('sshvpn.session', level='INFO') as logs:
+                self.assertTrue(healthy('192.0.2.1', lambda: None,
+                                        config={'connect_timeout': configured}))
+            arguments = fetch.call_args.args[0]
+            self.assertEqual(arguments[:2], ['/usr/bin/curl', '-q'])
+            self.assertEqual(float(arguments[arguments.index('--connect-timeout') + 1]), connection)
+            self.assertEqual(float(arguments[arguments.index('--max-time') + 1]), connection + 3)
+            self.assertEqual(fetch.call_args.kwargs['timeout'], connection + 4)
+            self.assertEqual(arguments[arguments.index('--noproxy') + 1], '*')
+            self.assertNotIn('--socks5-hostname', arguments)
+            event = json.loads(logs.output[0].split(':', 2)[2])
+            self.assertEqual(event['path'], 'system')
+            self.assertEqual(event['connect_timeout'], connection)
+            self.assertEqual(event['total_timeout'], connection + 3)
+
+    def test_socks_health_uses_forward_port_without_bypassing_explicit_proxy(self):
+        from sshvpn.session import healthy
+        pulse = mock.Mock()
+        with mock.patch('sshvpn.system.command', return_value='192.0.2.1\n') as fetch, \
+                self.assertLogs('sshvpn.session', level='INFO') as logs:
+            self.assertTrue(healthy('192.0.2.1', pulse, config={'connect_timeout': 15}, socks_port=43181))
+        arguments = fetch.call_args.args[0]
+        self.assertEqual(arguments[:2], ['/usr/bin/curl', '-q'])
+        self.assertEqual(arguments[arguments.index('--socks5-hostname') + 1], '127.0.0.1:43181')
+        self.assertEqual(arguments[arguments.index('--noproxy') + 1], '')
+        self.assertEqual(json.loads(logs.output[0].split(':', 2)[2])['path'], 'socks')
+        pulse.assert_called()
+
+    def test_health_records_bounded_curl_failure_and_pulses_before_fallback(self):
+        from sshvpn.session import healthy
+        reason = 'curl: (28) SSL connection timeout'
+        detail = reason + '\n' + 'x' * 10000 + '\n' + reason
+        failure = subprocess.CalledProcessError(28, ['curl'], output=detail)
+        pulse = mock.Mock()
+        with mock.patch('sshvpn.system.command', side_effect=[failure, '192.0.2.1\n']) as fetch, \
+                self.assertLogs('sshvpn.session', level='INFO') as logs:
+            self.assertTrue(healthy('192.0.2.1', pulse, config={'connect_timeout': 15}))
+        self.assertEqual(fetch.call_count, 2)
+        self.assertGreaterEqual(pulse.call_count, 2)
+        events = [json.loads(line.split(':', 2)[2]) for line in logs.output]
+        self.assertFalse(events[0]['ok'])
+        self.assertTrue(events[1]['ok'])
+        self.assertIn(reason, events[0]['curl_output'])
+        self.assertLessEqual(len(events[0]['curl_output']), 4096)
+        self.assertTrue(all(event['path'] == 'system' for event in events))
+
     def test_full_interactive_flow_starts_without_web_probes_and_rolls_back(self):
         import contextlib
         from sshvpn import system
-        for dns_failure in (False, True):
-            with self.subTest(dns_failure=dns_failure), tempfile.TemporaryDirectory() as name, contextlib.ExitStack() as stack:
+        for dns_failure, health_reconnect in ((False, False), (True, False), (False, True), (False, 'exhausted')):
+            with self.subTest(dns_failure=dns_failure, health_reconnect=health_reconnect), \
+                    tempfile.TemporaryDirectory() as name, contextlib.ExitStack() as stack:
                 root = Path(name)
                 (root / '.runtime').mkdir()
                 scratch = root / 'scratch'
@@ -590,8 +642,17 @@ class SessionTests(unittest.TestCase):
 
                 def changed(state):
                     states.append(copy.deepcopy(state))
-                    if state['phase'] == 'ready':
+                    if state['phase'] == 'ready' and (not health_reconnect or state.get('reconnects') == 1):
                         (root / '.runtime/system-stop.json').write_text(json.dumps({'run_id': state['run_id']}), encoding='utf-8')
+
+                def recovered(previous, command, username, log_path, config, pulse, requested, verify=None):
+                    self.assertIs(previous, children[0])
+                    self.assertIsNotNone(verify)
+                    self.assertTrue(verify())
+                    previous.poll.return_value = 0
+                    child = guarded()
+                    child.reconnect_attempts = 1
+                    return child
 
                 def cleanup(items):
                     live['tun'] = False
@@ -600,6 +661,8 @@ class SessionTests(unittest.TestCase):
 
                 config = load(ROOT)
                 config['backend_ready'] = True
+                if health_reconnect == 'exhausted':
+                    config['max_restarts'] = 1
                 replacements = {'STATE': root / 'state.json', 'LOCK': root / 'lock',
                     'command': command, 'MacRoutes': lambda: kernel, 'GuardedProcess': guarded,
                     'binary': lambda _: 'sing-box', 'free_ports': lambda *a, **k: None,
@@ -618,9 +681,23 @@ class SessionTests(unittest.TestCase):
                 stack.enter_context(mock.patch('sshvpn.system.subprocess.Popen', side_effect=popen))
                 health = stack.enter_context(mock.patch('sshvpn.session.healthy'))
                 traffic = stack.enter_context(mock.patch('sshvpn.manual.traffic'))
+                reconnect = stack.enter_context(mock.patch('sshvpn.session.reconnect', side_effect=recovered))
+                if health_reconnect:
+                    clock = [0.0]
+
+                    def advance(seconds):
+                        clock[0] += seconds
+
+                    health.side_effect = ([False, False, False, True, False, False, False]
+                        if health_reconnect == 'exhausted' else [False, False, False, True, True])
+                    stack.enter_context(mock.patch('sshvpn.system.time.monotonic', side_effect=lambda: clock[0]))
+                    stack.enter_context(mock.patch('sshvpn.system.time.sleep', side_effect=advance))
                 try:
                     if dns_failure:
                         with self.assertRaisesRegex(RuntimeError, 'DNS не зарегистрирован'):
+                            system.run(root, duration=0, interactive=True, on_state=changed)
+                    elif health_reconnect == 'exhausted':
+                        with self.assertRaisesRegex(RuntimeError, 'Исчерпан предел восстановления'):
                             system.run(root, duration=0, interactive=True, on_state=changed)
                     else:
                         system.run(root, duration=0, interactive=True, on_state=changed)
@@ -630,7 +707,29 @@ class SessionTests(unittest.TestCase):
                 self.assertEqual(kernel.routes, baseline)
                 self.assertFalse(live['tun'])
                 self.assertFalse(live['dns'])
-                health.assert_not_called()
+                if health_reconnect:
+                    exhausted = health_reconnect == 'exhausted'
+                    self.assertEqual(health.call_count, 7 if exhausted else 5)
+                    self.assertEqual([call.kwargs.get('socks_port') for call in health.call_args_list],
+                                     [None, None, None, config['listen_port']] + [None] * (3 if exhausted else 1))
+                    reconnect.assert_called_once()
+                    pending = next(s for s in states if s.get('transport_exit_verified'))
+                    self.assertTrue(pending['health_reconnect_pending'])
+                    self.assertEqual(pending['phase'], 'reconnecting')
+                    self.assertEqual(pending['child_guard_pids'][0], children[-1].process.pid)
+                    self.assertNotEqual(pending['child_guard_pids'][0], children[0].process.pid)
+                    if exhausted:
+                        self.assertFalse(any(s['phase'] == 'ready' and s.get('reconnects') == 1 for s in states))
+                        self.assertIn('Исчерпан предел восстановления', states[-1]['reason'])
+                    else:
+                        final_ready = next(s for s in states if s['phase'] == 'ready' and s.get('reconnects') == 1)
+                        self.assertFalse(final_ready['health_reconnect_pending'])
+                        self.assertEqual(final_ready['consecutive_health_failures'], 0)
+                        self.assertEqual(final_ready['health_checks'], 4)
+                        self.assertEqual(states[-1]['child_guard_pids'], final_ready['child_guard_pids'])
+                else:
+                    health.assert_not_called()
+                    reconnect.assert_not_called()
                 traffic.assert_not_called()
                 self.assertFalse(any(s['phase'] == 'awaiting_confirmation' for s in states))
                 self.assertEqual(any(s.get('persistent') for s in states), not dns_failure)
@@ -759,6 +858,64 @@ class SessionTests(unittest.TestCase):
                           {'max_restarts': 1, 'connect_timeout': 1}, lambda: None, lambda: False)
             self.assertEqual(spawn.call_count, 1)
         self.assertGreaterEqual(failed.wait.call_count, 1)
+
+    def test_reconnect_rejects_greeting_without_exit_and_accepts_verified_next_child(self):
+        from sshvpn.session import reconnect
+        previous, rejected, accepted = (mock.Mock() for _ in range(3))
+        rejected.process.pid, accepted.process.pid = 21001, 21002
+        previous.poll.return_value = 0
+        rejected.poll.return_value = accepted.poll.return_value = None
+        clock = [0.0]
+
+        def advance(seconds):
+            clock[0] += seconds
+
+        verify, pulse = mock.Mock(side_effect=[False, True]), mock.Mock()
+        with tempfile.TemporaryDirectory() as name, \
+                mock.patch('sshvpn.session.GuardedProcess', side_effect=[rejected, accepted]) as spawn, \
+                mock.patch('sshvpn.session.greeting', return_value=True), \
+                mock.patch('sshvpn.session.time.monotonic', side_effect=lambda: clock[0]), \
+                mock.patch('sshvpn.session.time.sleep', side_effect=advance):
+            result = reconnect(previous, ['ssh', '-N'], 'tester', Path(name) / 'ssh.log',
+                {'max_restarts': 2, 'connect_timeout': 3, 'forward_port': 43181},
+                pulse, lambda: False, verify=verify)
+        self.assertIs(result, accepted)
+        self.assertEqual(result.reconnect_attempts, 2)
+        self.assertEqual(spawn.call_count, 2)
+        self.assertEqual(verify.call_count, 2)
+        rejected.terminate.assert_called()
+        rejected.wait.assert_called()
+        accepted.terminate.assert_not_called()
+        self.assertGreaterEqual(pulse.call_count, 2)
+
+    def test_reconnect_stops_after_verified_exit_budget_and_releases_all_children(self):
+        from sshvpn.session import reconnect
+        previous = mock.Mock()
+        previous.poll.return_value = 0
+        children = [mock.Mock(), mock.Mock()]
+        for index, child in enumerate(children):
+            child.process.pid = 22001 + index
+            child.poll.return_value = None
+        clock = [0.0]
+
+        def advance(seconds):
+            clock[0] += seconds
+
+        verify = mock.Mock(return_value=False)
+        with tempfile.TemporaryDirectory() as name, \
+                mock.patch('sshvpn.session.GuardedProcess', side_effect=children) as spawn, \
+                mock.patch('sshvpn.session.greeting', return_value=True), \
+                mock.patch('sshvpn.session.time.monotonic', side_effect=lambda: clock[0]), \
+                mock.patch('sshvpn.session.time.sleep', side_effect=advance):
+            with self.assertRaisesRegex(RuntimeError, 'ограниченное число'):
+                reconnect(previous, ['ssh', '-N'], 'tester', Path(name) / 'ssh.log',
+                    {'max_restarts': 2, 'connect_timeout': 3, 'forward_port': 43181},
+                    lambda: None, lambda: False, verify=verify)
+        self.assertEqual(spawn.call_count, 2)
+        self.assertEqual(verify.call_count, 2)
+        for child in children:
+            child.terminate.assert_called()
+            child.wait.assert_called()
 
     def test_persistent_watchdog_survives_initial_lease_after_readiness(self):
         with tempfile.TemporaryDirectory() as name:
@@ -1206,13 +1363,43 @@ class SystemSafetyTests(unittest.TestCase):
                 dns_script(key)
 
     def test_system_fakeip_preserves_domains_without_auto_route(self):
-        generated = client(load(ROOT), Rules.load(ROOT), "system")
+        generated = client(dict(load(ROOT), ipv6_enabled=False), Rules.load(ROOT), "system")
         tun = next(i for i in generated["inbounds"] if i["type"] == "tun")
         self.assertFalse(tun["auto_route"])
         self.assertEqual(tun["dns_mode"], "disabled")
-        self.assertEqual(generated["dns"]["rules"][0]["server"], "dns-fake")
+        fake = next(rule for rule in generated['dns']['rules'] if rule.get('server') == 'dns-fake')
+        self.assertEqual(fake['query_type'], ['A'])
+        first = generated['dns']['rules'][0]
+        self.assertEqual(first['query_type'], ['AAAA'])
+        self.assertEqual(first['action'], 'predefined')
+        self.assertEqual(first['rcode'], 'NOERROR')
+        self.assertEqual(generated['dns']['strategy'], 'ipv4_only')
+        self.assertEqual(generated['route']['rules'][-1], {'action': 'resolve', 'strategy': 'ipv4_only'})
+        direct_index = next(i for i, rule in enumerate(generated['route']['rules'])
+                            if rule.get('outbound') == 'direct')
+        self.assertLess(direct_index, len(generated['route']['rules']) - 1)
         self.assertEqual(generated["route"]["final"], "ssh")
         self.assertFalse(any(r.get("ip_is_private") for r in generated["route"]["rules"]))
+
+    def test_explicit_ipv6_preserves_dual_stack_fakeip(self):
+        generated = client(dict(load(ROOT), ipv6_enabled=True), Rules(['direct.test'], []), 'system')
+        fake = next(rule for rule in generated['dns']['rules'] if rule.get('server') == 'dns-fake')
+        self.assertEqual(fake['query_type'], ['A', 'AAAA'])
+        self.assertEqual(generated['dns']['strategy'], 'prefer_ipv4')
+        self.assertFalse(any(rule.get('action') == 'predefined' and 'AAAA' in rule.get('query_type', [])
+                             for rule in generated['dns']['rules']))
+
+    def test_ipv6_default_and_type_are_validated_during_config_load(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            config = json.loads((ROOT / 'config.example.json').read_text(encoding='utf-8'))
+            config.pop('ipv6_enabled', None)
+            (root / 'config.json').write_text(json.dumps(config), encoding='utf-8')
+            self.assertFalse(load(root)['ipv6_enabled'])
+            config['ipv6_enabled'] = 'false'
+            (root / 'config.json').write_text(json.dumps(config), encoding='utf-8')
+            with self.assertRaises(ValueError):
+                load(root)
 
 
 class TransportTests(unittest.TestCase):
@@ -1333,6 +1520,7 @@ class TransportTests(unittest.TestCase):
 
     def test_fakeip_domains_route_in_real_engine(self):
         c = self.c.copy()
+        c['ipv6_enabled'] = False
         c["listen_port"], c["dns_port"] = port(), port()
         generated = client(c, Rules(["direct.test"], []), "system", interface="lo0", dns_ports={
             "dns-direct": self.direct_dns.port, "dns-ssh": self.remote_dns.port})
@@ -1343,6 +1531,15 @@ class TransportTests(unittest.TestCase):
         try:
             self.wait_port(c["listen_port"])
             for name in ("via.direct.test", "via.ssh.test"):
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as stream:
+                    stream.settimeout(3)
+                    stream.sendto(query(name, qtype=28), ('127.0.0.1', c['dns_port']))
+                    nodata = stream.recv(4096)
+                header = struct.unpack('!6H', nodata[:12])
+                self.assertTrue(header[1] & 0x8000)
+                self.assertEqual(header[1] & 0x000F, 0)
+                self.assertEqual(header[2], 1)
+                self.assertEqual(header[3], 0)
                 with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as stream:
                     stream.settimeout(3)
                     stream.sendto(query(name), ("127.0.0.1", c["dns_port"]))
